@@ -16,12 +16,19 @@ le = LabelEncoder()
 for col in df_train.columns:
     if df_train[col].dtype == object:
         df_train[col] = df_train[col].str.decode('utf-8')
+        ovalue = df_train[col][0]
         df_train[col] = le.fit_transform(df_train[col])
+        if col == "class":
+            print(col, ovalue, df_train[col][0])
 
 for col in df_test.columns:
     if df_test[col].dtype == object:
         df_test[col] = df_test[col].str.decode('utf-8')
+        ovalue = df_test[col][0]
         df_test[col] = le.fit_transform(df_test[col])
+        if col == "class":
+            print(col, ovalue, df_test[col][0])
+
 
 X_train = df_train.drop('class', axis=1)
 y_train = df_train['class']
