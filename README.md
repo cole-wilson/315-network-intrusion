@@ -1,1 +1,2 @@
 # 315-network-intrusion
+RF.py and XGBoost.py both test RandomForest and XGBoost respectively. Our final implementation is in threshold.py. seperate.py was used to compare attack types in the train/test datasets.
