@@ -1,3 +1,7 @@
+# https://ieeexplore.ieee.org/document/6009578 -- An excellent reference for clustering-based binary classification
+
+# https://www.researchgate.net/publication/271891551_Network_Anomaly_Detection_by_Cascading_K-Means_Clustering_and_C45_Decision_Tree_algorithm 
+# 
 import os
 import numpy as np
 import pandas as pd
@@ -42,18 +46,25 @@ CATEGORIES = {
     "Normal": ["normal"],
 }
 
-def categorise(attack_name):
+#  Returns the category for a given attack name
+def categorize(attack_name):
     for cat, attacks in CATEGORIES.items():
         if attack_name in attacks:
             return cat
     return "other"
 
+
+# Load data
 df_train = pd.read_csv(os.path.join(DATA_DIR, TRAIN_FILE), names=COLUMNS)
 df_test  = pd.read_csv(os.path.join(DATA_DIR, TEST_FILE),  names=COLUMNS)
 
+# Binary label: 0 = normal, 1 = attack
 df_train["is_attack"] = (df_train["attack"] != "normal").astype(int)
-df_test["is_attack"]  = (df_test["attack"]  != "normal").astype(int)
-df_test["category"]   = df_test["attack"].apply(categorise)
+df_test["is_attack"] = (df_test["attack"]  != "normal").astype(int)
+
+
+df_test["category"] = df_test["attack"].apply(categorize)
+
 
 for df in (df_train, df_test):
     if "num_outbound_cmds" in df.columns:
@@ -61,18 +72,20 @@ for df in (df_train, df_test):
 
 drop_cols = ["attack", "level", "is_attack", "category"]
 cat_cols  = ["protocol_type", "service", "flag"]
-num_cols  = [c for c in df_train.columns
-             if c not in drop_cols and c not in cat_cols]
 
+excluded_cols = set(drop_cols + cat_cols)
+num_cols = [col for col in df_train.columns if col not in excluded_cols]
+
+# https://www.geeksforgeeks.org/machine-learning/ml-one-hot-encoding/
 ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
 X_train_cat = ohe.fit_transform(df_train[cat_cols])
 X_test_cat  = ohe.transform(df_test[cat_cols])
 
-X_train = np.hstack([df_train[num_cols].astype(np.float32).values,
-                     X_train_cat.astype(np.float32)])
-X_test  = np.hstack([df_test[num_cols].astype(np.float32).values,
-                     X_test_cat.astype(np.float32)])
+X_train = np.hstack([df_train[num_cols].astype(np.float32).values, X_train_cat.astype(np.float32)])
+X_test  = np.hstack([df_test[num_cols].astype(np.float32).values, X_test_cat.astype(np.float32)])
 
+
+# https://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.MinMaxScaler.html -- Transform features by scaling each feature to a given range
 scaler = MinMaxScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled  = scaler.transform(X_test)
@@ -88,61 +101,70 @@ kmeans = MiniBatchKMeans(
 train_clusters = kmeans.fit_predict(X_train_scaled)
 test_clusters  = kmeans.predict(X_test_scaled)
 
-cluster_info = {}
-for cid in range(N_CLUSTERS):
-    mask = train_clusters == cid
-    labels = y_train[mask]
-    total = int(len(labels))
-    pct = ((labels == 1).sum() / total * 100) if total > 0 else 0.0
-    if total <= 50:
-        mapping = 1
-    elif pct < 0.01:
-        mapping = 0
-    elif pct > 99.9:
-        mapping = 1
-    else:
-        mapping = None
-    cluster_info[cid] = {"mapping": mapping, "size": total, "attack_pct": pct}
+cluster = {}
+for cluster_id in range(N_CLUSTERS):
+    labels = y_train[train_clusters == cluster_id]
+    total = len(labels)
+    cluster_attack_rate = 100 * np.mean(labels == 1) if total else 0.0
+
+    mapping = (
+        1 if total <= 50 else
+        0 if cluster_attack_rate < 0.01 else
+        1 if cluster_attack_rate > 99.9 else
+        None
+    )
+
+    cluster[cluster_id] = {
+        "mapping": mapping,
+        "size": int(total),
+        "cluster_attack_rate": float(cluster_attack_rate),
+    }
 
 print("training per cluster")
 cluster_models = {}
-for cid, info in cluster_info.items():
+for cluster_id, info in cluster.items():
     if info["mapping"] is not None:
         continue
-    mask = train_clusters == cid
+    mask = train_clusters == cluster_id
+
     rf = RandomForestClassifier(
         n_estimators=N_TREES, max_depth=MAX_DEPTH,
         max_features="sqrt", min_samples_split=20, min_samples_leaf=10,
         random_state=RANDOM_STATE, n_jobs=-1,
     )
     rf.fit(X_train_scaled[mask], y_train[mask])
-    cluster_models[cid] = rf
-    print(f"Cluster {cid}: trained (size={info['size']:,}, "f"attack%={info['attack_pct']:.1f}%)")
+    cluster_models[cluster_id] = rf
+    print(f"Cluster {cluster_id}: trained (size={info['size']:,}, "f"attack%={info['cluster_attack_rate']:.1f}%)")
 
-test_proba = np.zeros(len(X_test_scaled))
-for cid in np.unique(test_clusters):
-    mask = test_clusters == cid
-    info = cluster_info[cid]
-    if info["mapping"] is not None:
-        test_proba[mask] = float(info["mapping"])
+test_probability = np.zeros(len(X_test_scaled))
+for cluster_id in np.unique(test_clusters):
+    cluster_indices = np.where(test_clusters == cluster_id)[0]
+    cluster_data = X_test_scaled[cluster_indices]
+    cluster_mapping = cluster[cluster_id]["mapping"]
+
+    if cluster_mapping is not None:
+        test_probability[cluster_indices] = float(cluster_mapping)
     else:
-        test_proba[mask] = cluster_models[cid].predict_proba(X_test_scaled[mask])[:, 1]
+        probabilities = cluster_models[cluster_id].predict_proba(cluster_data)
+        test_probability[cluster_indices] = probabilities[:, 1]
 
+
+# Prints a specific thresholds metrics
 def report(threshold):
-    y_pred = (test_proba >= threshold).astype(int)
-    cm  = confusion_matrix(y_test, y_pred)
+    y_pred = (test_probability >= threshold).astype(int)
+    cm  = confusion_matrix(y_test, y_pred)  
     tn, fp, fn, tp = cm.ravel()
     acc = accuracy_score(y_test, y_pred)
     f1  = f1_score(y_test, y_pred)
-    dr  = tp / (tp + fn)
-    far = fp / (fp + tn)
+    detection_rate  = tp / (tp + fn)
+    false_alarm_rate = fp / (fp + tn)
 
     print("\n" + "=" * 60)
     print(f"RESULTS {threshold}")
     print(f"Accuracy:         {acc * 100:.2f}%")
     print(f"F1 Score:         {f1:.4f}")
-    print(f"Detection Rate:   {dr * 100:.2f}%  ({tp:,}/{tp + fn:,} caught)")
-    print(f"False Alarm Rate: {far * 100:.2f}%  ({fp:,})")
+    print(f"Detection Rate:   {detection_rate * 100:.2f}%  ({tp:,}/{tp + fn:,} caught)")
+    print(f"False Alarm Rate: {false_alarm_rate * 100:.2f}%  ({fp:,})")
 
     print("\nConfusion matrix:")
     print(f"                  Predicted Normal    Predicted Attack")
@@ -165,6 +187,9 @@ def report(threshold):
         n_caught = int(((sub["y_pred"] == 1) & (sub["y_true"] == 1)).sum())
         print(f"{cat:>6}: {n_caught / len(sub):.4f}  ({n_caught:,}/{len(sub):,})")
 
+
 report(0.5)
+
+# Here we use a very aggressive threshold, which results in a much higher detection rate with the cost being more false alarms.
 report(0.02)
 
